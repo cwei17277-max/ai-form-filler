@@ -2,16 +2,16 @@ import streamlit as st
 import pandas as pd
 import json
 import io
+import requests
+import base64
 from docx import Document
-from google import genai
-from google.genai import types
 
 # ------------------------------------------------------------------------------
 # 1. 页面基本配置
 # ------------------------------------------------------------------------------
 st.set_page_config(
-    page_title="AI 表格自动填写助手",
-    page_icon="📝",
+    page_title="AI 智能表格与文档处理中心",
+    page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -22,69 +22,161 @@ st.set_page_config(
 st.sidebar.title("⚙️ 设置")
 st.sidebar.markdown("---")
 
-# 优先从 Streamlit Secrets 读取，若无则允许界面输入
+secret_key = ""
+try:
+    if "GEMINI_API_KEY" in st.secrets:
+        secret_key = st.secrets["GEMINI_API_KEY"]
+except Exception:
+    pass
+
 api_key = st.sidebar.text_input(
     "Google Gemini API Key",
     type="password",
-    value=st.secrets.get("GEMINI_API_KEY", ""),
-    help="可在 Google AI Studio 免费获取 API Key"
+    value=secret_key,
+    help="可在 Google AI Studio (aistudio.google.com) 免费获取 API Key"
 )
 
-st.sidebar.info("""
-### 💡 设计原则
-**AI 辅助提取 ➔ 人工确认 ➔ 导出文件**  
-高风险业务流程中，AI 仅作填表预处理，最终提交前必须经过人工复核。
-""")
+st.sidebar.info(
+    "### 💡 功能说明\n"
+    "1. **智能文档/表格提取**：支持 PDF、图片、Word、Excel，提取关键字段。\n"
+    "2. **AI 按需实时生成表格**：根据提示词快速构建并导出所需的各类 Excel 报表。"
+)
 
 if not api_key:
-    st.warning("👈 请先在左侧边栏输入 Gemini API Key 以激活 AI 功能。")
+    st.warning("👈 请先在左侧边栏输入有效的 Gemini API Key 以激活 AI 功能。")
     st.stop()
 
-# 初始化 Client
-client = genai.Client(api_key=api_key)
+cleaned_api_key = api_key.strip()
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={cleaned_api_key}"
 
 # ------------------------------------------------------------------------------
-# 3. 核心 API 交互函数
+# 3. 核心 API 与文本/图像处理逻辑
 # ------------------------------------------------------------------------------
-def extract_information_from_file(uploaded_file):
-    """提取上传文件中的关键信息"""
-    prompt = """
-    请从上传的文档/图片中，精准提取以下信息并以标准 JSON 格式返回。
-    若某个字段在文档中未提及，请填 null。不要包含任何 markdown 代码块标记，只返回 JSON 字符串。
 
-    需要提取的字段：
-    - name (姓名)
-    - address (地址)
-    - company (公司)
-    - date (日期，格式 YYYY-MM-DD)
-    - id_number (证件号)
-    - amount (金额，数字或含货币单位)
-    """
-
-    file_bytes = uploaded_file.read()
-    mime_type = uploaded_file.type
-
+def call_gemini_api(payload):
+    """通用 REST 请求发送工具"""
+    headers = {"Content-Type": "application/json"}
     try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=[
-                types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
-                prompt
-            ],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json"
-            )
-        )
-        data = json.loads(response.text)
-        return data
+        response = requests.post(GEMINI_URL, json=payload, headers=headers)
+        res_json = response.json()
+        if response.status_code != 200:
+            error_msg = res_json.get("error", {}).get("message", "未知错误")
+            st.error(f"API 请求失败 ({response.status_code}): {error_msg}")
+            return None
+        
+        raw_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
+        
+        # 清理可能存在的 markdown 代码块包裹标记
+        if raw_text.startswith("```json"):
+            raw_text = raw_text[7:]
+        if raw_text.startswith("```"):
+            raw_text = raw_text[3:]
+        if raw_text.endswith("```"):
+            raw_text = raw_text[:-3]
+            
+        return json.loads(raw_text.strip())
     except Exception as e:
-        st.error(f"解析失败: {str(e)}")
+        st.error(f"解析 AI 返回数据失败: {str(e)}")
         return None
 
-def fill_docx_template(template_bytes, data_dict):
-    """将确认后的数据填入 Word (.docx) 模版占位符中 (例如 {{姓名}})"""
-    doc = Document(io.BytesIO(template_bytes))
+def extract_information_from_file(uploaded_file):
+    """支持 PDF、图片、Word、Excel 多格式提取"""
+    file_type = uploaded_file.type
+    file_name = uploaded_file.name.lower()
     
+    prompt = """
+    请从上传的文档/数据中，精准提取以下信息并以标准 JSON 格式返回。
+    若某个字段未提及，请填 null。只返回 JSON 字符串，不要包含额外说明。
+
+    需要提取的字段：
+    - name (姓名/联系人)
+    - address (地址)
+    - company (公司/单位名称)
+    - date (日期，格式 YYYY-MM-DD)
+    - id_number (证件号/单号/税号)
+    - amount (金额/总计数量)
+    """
+
+    # 情况 A: Excel 文件 (.xlsx, .xls)
+    if "spreadsheet" in file_type or file_name.endswith(('.xlsx', '.xls')):
+        try:
+            excel_df = pd.read_excel(uploaded_file)
+            excel_text = excel_df.to_string(index=False)
+            payload = {
+                "contents": [{"parts": [{"text": f"{prompt}\n\n以下是 Excel 表格的内容文本：\n{excel_text}"}]}],
+                "generationConfig": {"response_mime_type": "application/json"}
+            }
+            return call_gemini_api(payload)
+        except Exception as e:
+            st.error(f"Excel 读取失败: {str(e)}")
+            return None
+
+    # 情况 B: Word 文档 (.docx)
+    elif file_name.endswith('.docx'):
+        try:
+            doc = Document(uploaded_file)
+            full_text = []
+            for para in doc.paragraphs:
+                if para.text:
+                    full_text.append(para.text)
+            for table in doc.tables:
+                for row in table.rows:
+                    full_text.append(" | ".join([cell.text.strip() for cell in row.cells]))
+            doc_text = "\n".join(full_text)
+            
+            payload = {
+                "contents": [{"parts": [{"text": f"{prompt}\n\n以下是 Word 文档内容：\n{doc_text}"}]}],
+                "generationConfig": {"response_mime_type": "application/json"}
+            }
+            return call_gemini_api(payload)
+        except Exception as e:
+            st.error(f"Word 文件读取失败: {str(e)}")
+            return None
+
+    # 情况 C: 图片与 PDF (视觉/二进制读取)
+    else:
+        file_bytes = uploaded_file.read()
+        base64_data = base64.b64encode(file_bytes).decode("utf-8")
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"inline_data": {"mime_type": file_type if file_type else "application/pdf", "data": base64_data}},
+                    {"text": prompt}
+                ]
+            }],
+            "generationConfig": {"response_mime_type": "application/json"}
+        }
+        return call_gemini_api(payload)
+
+def generate_custom_table(user_prompt, reference_text=""):
+    """根据用户需求（及参考文档）实时生成定制化表格数据"""
+    system_prompt = f"""
+    你是一个专业的 Excel/数据分析专家。
+    请根据用户的需求描述（以及可选的参考资料），生成一份结构合理的表格。
+    返回格式必须为 JSON 对象，格式如下：
+    {{
+        "title": "表格名称",
+        "columns": ["列名1", "列名2", "列名3"],
+        "rows": [
+            {{"列名1": "数据1", "列名2": "数据2", "列名3": "数据3"}},
+            {{"列名1": "数据4", "列名2": "数据5", "列名3": "数据6"}}
+        ]
+    }}
+
+    用户需求：{user_prompt}
+    """
+    if reference_text:
+        system_prompt += f"\n参考上传文件背景内容：\n{reference_text}"
+
+    payload = {
+        "contents": [{"parts": [{"text": system_prompt}]}],
+        "generationConfig": {"response_mime_type": "application/json"}
+    }
+    return call_gemini_api(payload)
+
+def fill_docx_template(template_bytes, data_dict):
+    """Word 模版占位符填充"""
+    doc = Document(io.BytesIO(template_bytes))
     placeholder_map = {
         "{{姓名}}": str(data_dict.get("name", "") or ""),
         "{{地址}}": str(data_dict.get("address", "") or ""),
@@ -94,13 +186,11 @@ def fill_docx_template(template_bytes, data_dict):
         "{{金额}}": str(data_dict.get("amount", "") or "")
     }
 
-    # 替换段落中的占位符
     for p in doc.paragraphs:
         for key, value in placeholder_map.items():
             if key in p.text:
                 p.text = p.text.replace(key, value)
 
-    # 替换表格中的占位符
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
@@ -114,115 +204,171 @@ def fill_docx_template(template_bytes, data_dict):
     return output
 
 # ------------------------------------------------------------------------------
-# 4. 主界面逻辑
+# 4. 主界面 Tab 页构建
 # ------------------------------------------------------------------------------
-st.title("📝 AI 表格自动填写助手")
-st.caption("适用场景：企业行政 | 跨国贸易 | 保险理赔 | 移民/政府申请 | 学校注册")
+st.title("📊 AI 智能表格与文档处理中心")
+st.caption("集多格式文档关键字段提取、人工核对、以及 AI 实时建表导出于一体")
 
-st.markdown("---")
+main_tab1, main_tab2 = st.tabs(["📄 1. 多格式文档/表格识别提取", "✨ 2. AI 实时按需生成表格"])
 
-col1, col2 = st.columns([1, 1], gap="large")
+# ==============================================================================
+# TAB 1: 提取与填表
+# ==============================================================================
+with main_tab1:
+    col1, col2 = st.columns([1, 1], gap="large")
 
-with col1:
-    st.subheader("1. 上传源资料文档")
-    uploaded_source = st.file_uploader(
-        "支持 PDF、图片 (PNG/JPG)、Word 文档",
-        type=["pdf", "png", "jpg", "jpeg", "docx"],
-        key="source"
-    )
+    with col1:
+        st.subheader("1. 上传源资料")
+        uploaded_source = st.file_uploader(
+            "支持 PDF、图片 (PNG/JPG)、Word (.docx)、Excel (.xlsx/.xls)",
+            type=["pdf", "png", "jpg", "jpeg", "docx", "xlsx", "xls"],
+            key="source"
+        )
 
-    if uploaded_source:
-        st.success(f"已读取文件: `{uploaded_source.name}`")
-        if st.button("🚀 开始 AI 智能提取", type="primary"):
-            with st.spinner("AI 正在扫描文档并提取要素..."):
-                extracted_data = extract_information_from_file(uploaded_source)
-                if extracted_data:
-                    st.session_state["extracted_data"] = extracted_data
-                    st.toast("提取成功！请在右侧核对数据。", icon="✅")
+        if uploaded_source:
+            st.success(f"已读取文件: `{uploaded_source.name}`")
+            if st.button("🚀 开始 AI 智能提取", type="primary"):
+                with st.spinner("AI 正在解析文档/表格..."):
+                    extracted_data = extract_information_from_file(uploaded_source)
+                    if extracted_data:
+                        st.session_state["extracted_data"] = extracted_data
+                        st.toast("提取成功！请在右侧核对数据。", icon="✅")
 
-with col2:
-    st.subheader("2. 人工核对与确认 (Human-in-the-Loop)")
-    
-    if "extracted_data" in st.session_state:
-        data = st.session_state["extracted_data"]
+    with col2:
+        st.subheader("2. 人工核对与确认 (Human-in-the-Loop)")
         
-        st.warning("⚠️ 高风险控制：请仔细核对并手动修正 AI 提取的信息，确认无误后方可导出。")
-        
-        with st.form("verify_form"):
-            name = st.text_input("姓名", value=data.get("name", ""))
-            address = st.text_input("地址", value=data.get("address", ""))
-            company = st.text_input("公司", value=data.get("company", ""))
-            date = st.text_input("日期", value=data.get("date", ""))
-            id_number = st.text_input("证件号", value=data.get("id_number", ""))
-            amount = st.text_input("金额", value=data.get("amount", ""))
+        if "extracted_data" in st.session_state:
+            data = st.session_state["extracted_data"]
+            st.warning("⚠️ 高风险控制：请核对并手动修正 AI 提取的信息，确认后方可导出。")
             
-            confirm_check = st.checkbox("我已人工复核上述所有数据，确认真实准确", value=False)
-            submit_btn = st.form_submit_button("确认并锁定数据")
+            with st.form("verify_form"):
+                name = st.text_input("姓名/联系人", value=data.get("name", "") or "")
+                address = st.text_input("地址", value=data.get("address", "") or "")
+                company = st.text_input("公司/单位", value=data.get("company", "") or "")
+                date = st.text_input("日期", value=data.get("date", "") or "")
+                id_number = st.text_input("证件号/单号/税号", value=data.get("id_number", "") or "")
+                amount = st.text_input("金额/数量", value=data.get("amount", "") or "")
+                
+                confirm_check = st.checkbox("我已人工复核上述所有数据，确认真实准确", value=False)
+                submit_btn = st.form_submit_button("确认并锁定数据")
 
-            if submit_btn:
-                if not confirm_check:
-                    st.error("请先勾选确认复核框！")
-                else:
-                    st.session_state["verified_data"] = {
-                        "name": name,
-                        "address": address,
-                        "company": company,
-                        "date": date,
-                        "id_number": id_number,
-                        "amount": amount
-                    }
-                    st.success("数据已确认锁定！可在下方生成/导出表格。")
+                if submit_btn:
+                    if not confirm_check:
+                        st.error("请先勾选确认复核框！")
+                    else:
+                        st.session_state["verified_data"] = {
+                            "name": name, "address": address, "company": company,
+                            "date": date, "id_number": id_number, "amount": amount
+                        }
+                        st.success("数据已确认锁定！可在下方导出。")
+        else:
+            st.info("👈 请先在左侧上传源文档/表格并点击提取。")
+
+    st.markdown("---")
+    st.subheader("3. 导出填充后的表格/模版")
+
+    if "verified_data" in st.session_state:
+        v_data = st.session_state["verified_data"]
+        tab_sub1, tab_sub2 = st.tabs(["导出为 Excel", "填充 Word 模版"])
+        
+        with tab_sub1:
+            df = pd.DataFrame([v_data])
+            df_rename = df.rename(columns={
+                "name": "姓名/联系人", "address": "地址", "company": "公司/单位",
+                "date": "日期", "id_number": "证件号/单号", "amount": "金额/数量"
+            })
+            st.dataframe(df_rename, use_container_width=True)
+            
+            excel_buffer = io.BytesIO()
+            with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                df_rename.to_excel(writer, index=False, sheet_name='Sheet1')
+            excel_buffer.seek(0)
+            
+            st.download_button(
+                label="📥 下载 Excel 文件",
+                data=excel_buffer,
+                file_name="已确认_数据提取表.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            
+        with tab_sub2:
+            template_file = st.file_uploader("上传 Word 模版文件 (.docx)", type=["docx"], key="template")
+            if template_file:
+                if st.button("生成最终 Word 表格文档"):
+                    filled_doc = fill_docx_template(template_file.read(), v_data)
+                    st.download_button(
+                        label="📥 下载已填写的 Word 文档",
+                        data=filled_doc,
+                        file_name="已确认_填充模板.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    )
     else:
-        st.info("👈 请先在左侧上传源文档并点击提取。")
+        st.info("💡 请先完成步骤 2 中的人工确认，即可激活导出功能。")
 
-# ------------------------------------------------------------------------------
-# 5. 表格填充与导出模块
-# ------------------------------------------------------------------------------
-st.markdown("---")
-st.subheader("3. 导出填充后的表格")
-
-if "verified_data" in st.session_state:
-    v_data = st.session_state["verified_data"]
+# ==============================================================================
+# TAB 2: AI 按需实时生成表格
+# ==============================================================================
+with main_tab2:
+    st.subheader("✨ 根据需求定制或重构专属表格")
+    st.markdown("你可以直接输入自然语言指令（例如：`请帮我生成一张包含 5 条数据的 PCB 成品仓库出入库明细表，包含料号、 Date Code、入库数量、责任人`）。")
     
-    tab1, tab2 = st.tabs(["导出为 Excel", "填充 Word 模版"])
+    col_gen1, col_gen2 = st.columns([1, 1], gap="large")
     
-    with tab1:
-        st.markdown("将确认的数据打包导出为标准 Excel 表格：")
-        df = pd.DataFrame([v_data])
-        
-        # 重命名列名以符合中文规范
-        df_rename = df.rename(columns={
-            "name": "姓名", "address": "地址", "company": "公司",
-            "date": "日期", "id_number": "证件号", "amount": "金额"
-        })
-        
-        st.dataframe(df_rename, use_container_width=True)
-        
-        excel_buffer = io.BytesIO()
-        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-            df_rename.to_excel(writer, index=False, sheet_name='Sheet1')
-        excel_buffer.seek(0)
-        
-        st.download_button(
-            label="📥 下载 Excel 文件",
-            data=excel_buffer,
-            file_name="已确认_填写表格.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    with col_gen1:
+        ref_file = st.file_uploader(
+            "可选：上传参考背景文件 (PDF / Excel / Word / 图片)",
+            type=["pdf", "png", "jpg", "jpeg", "docx", "xlsx", "xls"],
+            key="gen_ref"
         )
         
-    with tab2:
-        st.markdown("上传带有占位符（如 `{{姓名}}`、`{{证件号}}`）的 Word 模版进行替换：")
-        template_file = st.file_uploader("上传 Word 模版文件 (.docx)", type=["docx"], key="template")
+        custom_prompt = st.text_area(
+            "📝 输入你对表格的需求描述：",
+            placeholder="例如：请生成一份跨国物流海关报关核对表，包含出货日期、箱数、净重、毛重、HS CODE 及预估关税金额，并填入 3 条示例数据。",
+            height=150
+        )
         
-        if template_file:
-            if st.button("生成最终 Word 表格文档"):
-                filled_doc = fill_docx_template(template_file.read(), v_data)
-                st.download_button(
-                    label="📥 下载已填写的 Word 文档",
-                    data=filled_doc,
-                    file_name="已确认_填充模板.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                )
-else:
-    st.gray()
-    st.text("请先在步骤 2 中完成人工确认，即可激活导出功能。")
+        generate_btn = st.button("🚀 AI 实时生成表格", type="primary")
+
+    with col_gen2:
+        if generate_btn:
+            if not custom_prompt.strip():
+                st.warning("请先填写表格需求描述！")
+            else:
+                ref_text = ""
+                if ref_file:
+                    st.info(f"正在读取参考文件: `{ref_file.name}`...")
+                    # 简单提取参考文件内容
+                    if ref_file.name.endswith(('.xlsx', '.xls')):
+                        ref_text = pd.read_excel(ref_file).to_string(index=False)
+                    elif ref_file.name.endswith('.docx'):
+                        doc = Document(ref_file)
+                        ref_text = "\n".join([p.text for p in doc.paragraphs if p.text])
+
+                with st.spinner("AI 正在根据你的需求设计并生成表格..."):
+                    gen_result = generate_custom_table(custom_prompt, ref_text)
+                    if gen_result and "rows" in gen_result:
+                        st.session_state["generated_table_data"] = gen_result
+                        st.toast("表格生成成功！", icon="🎉")
+
+        if "generated_table_data" in st.session_state:
+            gen_data = st.session_state["generated_table_data"]
+            table_title = gen_data.get("title", "AI 生成表格")
+            rows = gen_data.get("rows", [])
+            
+            st.success(f"📋 表格预览：**{table_title}**")
+            
+            df_gen = pd.DataFrame(rows)
+            st.dataframe(df_gen, use_container_width=True)
+            
+            # 提供下载按钮
+            excel_gen_buffer = io.BytesIO()
+            with pd.ExcelWriter(excel_gen_buffer, engine='openpyxl') as writer:
+                df_gen.to_excel(writer, index=False, sheet_name='Sheet1')
+            excel_gen_buffer.seek(0)
+            
+            st.download_button(
+                label=f"📥 下载【{table_title}】.xlsx",
+                data=excel_gen_buffer,
+                file_name=f"{table_title}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
